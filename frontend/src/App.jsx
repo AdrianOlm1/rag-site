@@ -118,6 +118,7 @@ export default function App() {
   // Chunk preview state
   const [chunkPreviews, setChunkPreviews] = useState({}); // { [docId]: { loading, chunks, error } }
   const [openPreviewId, setOpenPreviewId] = useState(null);
+  const [popoverPos, setPopoverPos] = useState({ top: 0, left: 0 }); // fixed coords for desktop popover
   // Upload progress state
   const [uploadProgress, setUploadProgress] = useState(0);
   const progressIntervalRef = useRef(null);
@@ -326,6 +327,15 @@ export default function App() {
     if (openPreviewId === docId) {
       setOpenPreviewId(null);
     } else {
+      // Compute position from the button element for the fixed popover
+      const rect = e.currentTarget.getBoundingClientRect();
+      const isMobile = window.innerWidth <= 768;
+      if (!isMobile) {
+        // Place popover to the right of the sidebar button
+        const top = Math.min(rect.top, window.innerHeight - 360);
+        const left = rect.right + 8;
+        setPopoverPos({ top, left });
+      }
       setOpenPreviewId(docId);
       fetchChunks(docId);
     }
@@ -1124,7 +1134,7 @@ export default function App() {
 
         /* ── Chunk preview ── */
         .doc-item-wrapper {
-          position: relative;
+          position: static;
         }
 
         .doc-preview-btn {
@@ -1146,16 +1156,14 @@ export default function App() {
         .doc-preview-btn.active { opacity: 1; color: var(--accent); }
 
         .chunk-popover {
-          position: absolute;
-          left: calc(100% + 8px);
-          top: 0;
-          z-index: 200;
+          position: fixed;
+          z-index: 300;
           width: 300px;
-          max-height: 320px;
+          max-height: 340px;
           background: var(--surface);
           border: 1px solid var(--border);
           border-radius: var(--radius);
-          box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+          box-shadow: 0 8px 32px rgba(0,0,0,0.22);
           display: flex;
           flex-direction: column;
           animation: fadeInScale 0.15s ease;
@@ -1217,19 +1225,48 @@ export default function App() {
 
         /* ── Mobile ───────────────────────────────────────────────────────────── */
         @media (max-width: 768px) {
-          body {
-            overflow: auto;
-            -webkit-overflow-scrolling: touch;
-            height: 100dvh;
-            min-height: -webkit-fill-available;
+          /* Lock body to exact viewport — no scrolling, no black bar */
+          html, body {
+            height: 100%;
+            height: -webkit-fill-available;
+            overflow: hidden;
+            position: fixed;
+            width: 100%;
           }
 
           .layout {
-            grid-template-columns: 1fr;
-            min-height: 100dvh;
-            min-height: 100vh;
+            height: 100%;
+            height: -webkit-fill-available;
+            height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
           }
-          .main { min-width: 0; }
+
+          /* Main fills remaining space and handles its own internal scroll */
+          .main {
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            height: 100%;
+          }
+
+          .chat-area {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            padding: 16px;
+            gap: 12px;
+          }
+
+          .input-area {
+            flex-shrink: 0;
+            padding: 10px 16px;
+            padding-bottom: max(12px, env(safe-area-inset-bottom));
+          }
 
           .sidebar-backdrop {
             display: block;
@@ -1295,13 +1332,14 @@ export default function App() {
             left: 16px;
             right: 16px;
             top: auto;
-            bottom: 80px;
+            bottom: max(80px, calc(env(safe-area-inset-bottom) + 70px));
             width: auto;
-            max-height: 40vh;
+            max-height: 45vh;
           }
           .scope-bar { margin: 8px 12px 12px; padding: 10px 12px; }
 
           .main-header {
+            flex-shrink: 0;
             padding: 12px 16px;
             gap: 8px;
             min-height: 56px;
@@ -1314,19 +1352,10 @@ export default function App() {
           .theme-toggle { width: 44px; height: 44px; padding: 0; display: flex; align-items: center; justify-content: center; }
           .clear-btn { padding: 10px 14px; font-size: 12px; }
 
-          .chat-area {
-            padding: 16px;
-            gap: 12px;
-            padding-bottom: env(safe-area-inset-bottom, 16px);
-          }
           .empty-state h2 { font-size: 22px; }
           .empty-state p { font-size: 13px; max-width: 100%; padding: 0 8px; }
           .message-bubble { padding: 12px 14px; font-size: 15px; }
 
-          .input-area {
-            padding: 12px 16px 20px;
-            padding-bottom: max(20px, env(safe-area-inset-bottom));
-          }
           .input-row {
             padding: 10px 10px 10px 14px;
             min-height: 52px;
@@ -1340,7 +1369,14 @@ export default function App() {
           }
           .input-hint { font-size: 10px; margin-top: 6px; }
 
-          .access-gate { padding: 16px; align-items: flex-start; padding-top: max(16px, env(safe-area-inset-top)); }
+          .access-gate {
+            height: 100%;
+            height: -webkit-fill-available;
+            height: 100dvh;
+            padding: 16px;
+            align-items: center;
+            overflow: auto;
+          }
           .access-gate-box { padding: 24px 20px; max-width: 100%; }
         }
 
@@ -1349,7 +1385,7 @@ export default function App() {
           .sidebar { width: 100%; }
           .main-header { padding: 10px 12px; }
           .chat-area { padding: 12px; }
-          .input-area { padding: 10px 12px 16px; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+          .input-area { padding: 8px 12px; padding-bottom: max(10px, env(safe-area-inset-bottom)); }
         }
       `}</style>
 
@@ -1504,11 +1540,17 @@ export default function App() {
                     </button>
                   </div>
 
-                  {/* Chunk preview popover */}
+                  {/* Chunk preview popover — rendered inline but positioned fixed via JS coords on desktop */}
                   {openPreviewId === doc.id && (() => {
                     const state = chunkPreviews[doc.id];
                     return (
-                      <div className="chunk-popover">
+                      <div
+                        className="chunk-popover"
+                        style={window.innerWidth > 768
+                          ? { top: popoverPos.top, left: popoverPos.left }
+                          : undefined
+                        }
+                      >
                         <div className="chunk-popover-header">
                           Chunks — {doc.filename}
                         </div>
