@@ -5,7 +5,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from pydantic import BaseModel
 from typing import List, Optional
 import os
@@ -24,10 +24,15 @@ ACCESS_CODE = (os.getenv("ACCESS_CODE") or "").strip()
 
 
 def require_access_code(request: Request):
-    """If ACCESS_CODE is set, require X-Access-Code header to match; otherwise allow."""
+    """If ACCESS_CODE is set, require access code via X-Access-Code or Authorization: Bearer <code>."""
     if not ACCESS_CODE:
         return
+    # Accept X-Access-Code or Authorization: Bearer <code> (Bearer is less likely to be stripped by proxies)
     provided = (request.headers.get("X-Access-Code") or "").strip()
+    if not provided:
+        auth = (request.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
     if provided != ACCESS_CODE:
         raise HTTPException(status_code=401, detail="Invalid or missing access code")
 from chunker import extract_text_from_pdf, chunk_text
@@ -157,7 +162,11 @@ def list_documents(db: Session = Depends(get_db), _: None = Depends(require_acce
 @app.delete("/api/documents/{document_id}")
 def delete_document(document_id: str, db: Session = Depends(get_db), _: None = Depends(require_access_code)):
     """Delete a document and all its chunks."""
-    doc = db.query(Document).filter(Document.id == document_id).first()
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID.")
+    doc = db.query(Document).filter(Document.id == doc_uuid).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
     db.delete(doc)
@@ -179,29 +188,41 @@ async def chat(request: Request, body: ChatRequest, db: Session = Depends(get_db
     # Filter by document_ids if provided (only search in selected docs)
     embedding_str = "[" + ",".join(str(x) for x in question_embedding) + "]"
 
-    # Normalize: only use non-empty IDs and cast to UUID in SQL so the filter is strict
-    doc_ids_to_use = [str(did).strip() for did in (body.document_ids or []) if did and str(did).strip()]
+    # Normalize: only use non-empty, valid UUIDs so the filter is strict
+    doc_ids_raw = [str(did).strip() for did in (body.document_ids or []) if did and str(did).strip()]
+    doc_ids_to_use = []
+    for did in doc_ids_raw:
+        try:
+            doc_ids_to_use.append(uuid.UUID(did))
+        except ValueError:
+            pass
 
     if doc_ids_to_use:
-        # Explicit ::uuid cast so PostgreSQL matches only these documents
-        doc_ids_sql = ", ".join(f"'{did}'::uuid" for did in doc_ids_to_use)
-        filter_clause = f"AND c.document_id IN ({doc_ids_sql})"
+        sql = text("""
+            SELECT c.content, d.filename, c.embedding <=> :embedding AS distance
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.document_id IN :doc_ids
+            ORDER BY distance ASC
+            LIMIT :top_k
+        """).bindparams(bindparam("doc_ids", expanding=True))
+        results = db.execute(sql, {
+            "embedding": embedding_str,
+            "top_k": body.top_k,
+            "doc_ids": doc_ids_to_use,
+        }).fetchall()
     else:
-        filter_clause = ""
-
-    sql = text(f"""
-        SELECT c.content, d.filename, c.embedding <=> :embedding AS distance
-        FROM chunks c
-        JOIN documents d ON c.document_id = d.id
-        WHERE 1=1 {filter_clause}
-        ORDER BY distance ASC
-        LIMIT :top_k
-    """)
-
-    results = db.execute(sql, {
-        "embedding": embedding_str,
-        "top_k": body.top_k
-    }).fetchall()
+        sql = text("""
+            SELECT c.content, d.filename, c.embedding <=> :embedding AS distance
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            ORDER BY distance ASC
+            LIMIT :top_k
+        """)
+        results = db.execute(sql, {
+            "embedding": embedding_str,
+            "top_k": body.top_k,
+        }).fetchall()
 
     if not results:
         raise HTTPException(status_code=404, detail="No relevant content found. Try uploading a document first.")

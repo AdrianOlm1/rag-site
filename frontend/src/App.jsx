@@ -116,7 +116,11 @@ export default function App() {
   }
 
   function authHeaders() {
-    return accessCode ? { "X-Access-Code": accessCode } : {};
+    if (!accessCode) return {};
+    return {
+      "X-Access-Code": accessCode,
+      "Authorization": `Bearer ${accessCode}`,
+    };
   }
 
   useEffect(() => {
@@ -170,9 +174,26 @@ export default function App() {
   }
 
   async function deleteDocument(id) {
-    await fetch(`${API}/api/documents/${id}`, { method: "DELETE" });
-    setSelectedIds(prev => { const s = new Set(prev); s.delete(id); return s; });
-    await fetchDocuments();
+    try {
+      const res = await fetch(`${API}/api/documents/${id}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (res.status === 401) {
+        lockOut();
+        return;
+      }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(err.detail || "Failed to delete document.");
+        return;
+      }
+      setSelectedIds(prev => { const s = new Set(prev); s.delete(id); return s; });
+      await fetchDocuments();
+    } catch (e) {
+      console.error("Delete document failed", e);
+      alert("Failed to delete document. Is the backend running?");
+    }
   }
 
   function toggleSelect(id) {
@@ -260,7 +281,9 @@ export default function App() {
     setGateLoading(true);
     try {
       const code = gateInput.trim();
-      const headers = code ? { "X-Access-Code": code } : {};
+      const headers = code
+        ? { "X-Access-Code": code, "Authorization": `Bearer ${code}` }
+        : {};
       const res = await fetch(`${API}/api/documents`, { headers });
       if (res.status === 401) {
         setGateError("Invalid code");
