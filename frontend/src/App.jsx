@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { createPortal } from "react-dom";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -327,13 +328,18 @@ export default function App() {
     if (openPreviewId === docId) {
       setOpenPreviewId(null);
     } else {
-      // Compute position from the button element for the fixed popover
       const rect = e.currentTarget.getBoundingClientRect();
       const isMobile = window.innerWidth <= 768;
       if (!isMobile) {
-        // Place popover to the right of the sidebar button
-        const top = Math.min(rect.top, window.innerHeight - 360);
-        const left = rect.right + 8;
+        const popoverW = 300;
+        const popoverH = 340;
+        // Prefer right of sidebar; clamp so popover never goes off-screen
+        let left = rect.right + 8;
+        if (left + popoverW > window.innerWidth - 8) {
+          // Not enough room to the right — flip to left of the button
+          left = rect.left - popoverW - 8;
+        }
+        const top = Math.min(rect.top, window.innerHeight - popoverH - 8);
         setPopoverPos({ top, left });
       }
       setOpenPreviewId(docId);
@@ -1540,13 +1546,14 @@ export default function App() {
                     </button>
                   </div>
 
-                  {/* Chunk preview popover — rendered inline but positioned fixed via JS coords on desktop */}
+                  {/* Chunk preview popover — portal-mounted so it escapes sidebar overflow/transform */}
                   {openPreviewId === doc.id && (() => {
                     const state = chunkPreviews[doc.id];
-                    return (
+                    const isMobile = window.innerWidth <= 768;
+                    const popover = (
                       <div
                         className="chunk-popover"
-                        style={window.innerWidth > 768
+                        style={!isMobile
                           ? { top: popoverPos.top, left: popoverPos.left }
                           : undefined
                         }
@@ -1572,6 +1579,7 @@ export default function App() {
                         </div>
                       </div>
                     );
+                    return createPortal(popover, document.body);
                   })()}
                 </div>
               ))
