@@ -54,6 +54,28 @@ const MoonIcon = () => (
   </svg>
 );
 
+const MenuIcon = () => (
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <line x1="3" y1="6" x2="21" y2="6"/>
+    <line x1="3" y1="12" x2="21" y2="12"/>
+    <line x1="3" y1="18" x2="21" y2="18"/>
+  </svg>
+);
+
+const CloseIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <line x1="18" y1="6" x2="6" y2="18"/>
+    <line x1="6" y1="6" x2="18" y2="18"/>
+  </svg>
+);
+
+const EyeIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+    <circle cx="12" cy="12" r="3"/>
+  </svg>
+);
+
 // ─── App ───────────────────────────────────────────────────────────────────────
 
 const THEME_KEY = "docqa-theme";
@@ -68,6 +90,7 @@ export default function App() {
   const [chatLoading, setChatLoading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [tab, setTab] = useState("chat"); // "chat" | "library"
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [theme, setTheme] = useState(() => {
     try {
       const saved = localStorage.getItem(THEME_KEY);
@@ -92,6 +115,12 @@ export default function App() {
   const [gateInput, setGateInput] = useState("");
   const [gateError, setGateError] = useState("");
   const [gateLoading, setGateLoading] = useState(false);
+  // Chunk preview state
+  const [chunkPreviews, setChunkPreviews] = useState({}); // { [docId]: { loading, chunks, error } }
+  const [openPreviewId, setOpenPreviewId] = useState(null);
+  // Upload progress state
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const progressIntervalRef = useRef(null);
   const fileInputRef = useRef(null);
   const chatEndRef = useRef(null);
   const textareaRef = useRef(null);
@@ -131,6 +160,18 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Close chunk preview popover when clicking outside
+  useEffect(() => {
+    if (!openPreviewId) return;
+    function handleClickOutside(e) {
+      if (!e.target.closest(".doc-item-wrapper")) {
+        setOpenPreviewId(null);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [openPreviewId]);
+
   async function fetchDocuments() {
     try {
       const res = await fetch(`${API}/api/documents`, { headers: authHeaders() });
@@ -146,15 +187,50 @@ export default function App() {
   }
 
   async function uploadFile(file) {
-    if (!file.name.endsWith(".pdf")) {
-      alert("Only PDF files are supported.");
+    const ALLOWED_EXTS = [".pdf", ".docx", ".txt", ".md", ".csv"];
+    const isAllowed = ALLOWED_EXTS.some(ext => file.name.toLowerCase().endsWith(ext));
+    if (!isAllowed) {
+      alert("Unsupported file type. Allowed: .pdf, .docx, .txt, .md, .csv");
       return;
     }
+
     setUploading(true);
+    setUploadProgress(0);
+
+    // Phase 1: shoot to 30% quickly (simulates extraction phase, ~800ms)
+    let phase1Done = false;
+    let phase1Progress = 0;
+    const phase1Id = setInterval(() => {
+      phase1Progress += 3;
+      if (phase1Progress >= 30) {
+        phase1Progress = 30;
+        clearInterval(phase1Id);
+        phase1Done = true;
+        // Phase 2: slow drift toward 70% (simulates embedding wait)
+        progressIntervalRef.current = setInterval(() => {
+          setUploadProgress(prev => {
+            if (prev >= 70) return prev;
+            const increment = 0.5 + Math.random() * 1.5;
+            return Math.min(70, prev + increment);
+          });
+        }, 400);
+      }
+      setUploadProgress(phase1Progress);
+    }, 80);
+
     const form = new FormData();
     form.append("file", file);
     try {
       const res = await fetch(`${API}/api/documents`, { method: "POST", body: form, headers: authHeaders() });
+
+      // Phase 3: complete — clear all intervals and jump to 100%
+      clearInterval(phase1Id);
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current);
+        progressIntervalRef.current = null;
+      }
+      setUploadProgress(100);
+
       if (res.status === 401) {
         lockOut();
         return;
@@ -165,11 +241,22 @@ export default function App() {
       } else {
         await fetchDocuments();
         setTab("chat");
+        setSidebarOpen(false);
       }
     } catch (e) {
+      clearInterval(phase1Id);
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current);
+        progressIntervalRef.current = null;
+      }
+      setUploadProgress(0);
       alert("Upload failed. Is the backend running?");
     } finally {
-      setUploading(false);
+      // Brief pause at 100% before resetting
+      setTimeout(() => {
+        setUploading(false);
+        setUploadProgress(0);
+      }, 600);
     }
   }
 
@@ -189,10 +276,58 @@ export default function App() {
         return;
       }
       setSelectedIds(prev => { const s = new Set(prev); s.delete(id); return s; });
+      // Clean up cached chunk preview data for this document
+      setChunkPreviews(prev => { const c = { ...prev }; delete c[id]; return c; });
+      if (openPreviewId === id) setOpenPreviewId(null);
       await fetchDocuments();
     } catch (e) {
       console.error("Delete document failed", e);
       alert("Failed to delete document. Is the backend running?");
+    }
+  }
+
+  async function fetchChunks(docId) {
+    // If already loaded, skip the network request
+    if (chunkPreviews[docId]?.chunks) return;
+
+    setChunkPreviews(prev => ({
+      ...prev,
+      [docId]: { loading: true, chunks: null, error: null },
+    }));
+
+    try {
+      const res = await fetch(`${API}/api/documents/${docId}/chunks`, {
+        headers: authHeaders(),
+      });
+      if (res.status === 401) { lockOut(); return; }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setChunkPreviews(prev => ({
+          ...prev,
+          [docId]: { loading: false, chunks: null, error: err.detail || "Failed to load." },
+        }));
+        return;
+      }
+      const data = await res.json();
+      setChunkPreviews(prev => ({
+        ...prev,
+        [docId]: { loading: false, chunks: data, error: null },
+      }));
+    } catch (e) {
+      setChunkPreviews(prev => ({
+        ...prev,
+        [docId]: { loading: false, chunks: null, error: "Network error." },
+      }));
+    }
+  }
+
+  function togglePreview(e, docId) {
+    e.stopPropagation();
+    if (openPreviewId === docId) {
+      setOpenPreviewId(null);
+    } else {
+      setOpenPreviewId(docId);
+      fetchChunks(docId);
     }
   }
 
@@ -370,25 +505,98 @@ export default function App() {
 
         .layout {
           display: grid;
-          grid-template-columns: 280px 1fr;
+          grid-template-columns: 1fr;
           height: 100vh;
           background: var(--bg-hue);
           transition: background 0.35s ease;
         }
+        @media (min-width: 769px) {
+          .layout.sidebar-open .main { margin-left: 280px; }
+        }
 
         /* ── Sidebar ── */
         .sidebar {
+          position: fixed;
+          left: 0;
+          top: 0;
+          bottom: 0;
+          z-index: 99;
+          width: 280px;
           background: var(--surface);
           border-right: 1px solid var(--border);
           display: flex;
           flex-direction: column;
           overflow: hidden;
-          transition: background 0.35s ease, border-color 0.35s ease;
+          transform: translateX(-100%);
+          transition: transform 0.3s cubic-bezier(0.32, 0.72, 0, 1), background 0.35s ease, border-color 0.35s ease;
         }
+        .sidebar.sidebar-open { transform: translateX(0); }
+
+        .main {
+          margin-left: 0;
+          transition: margin-left 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+        }
+
+        .sidebar-backdrop {
+          display: none;
+        }
+
+        .menu-btn { display: flex; }
+        .layout.sidebar-open .menu-btn { display: none; }
+        .sidebar-close-btn { display: flex; }
 
         .sidebar-header {
           padding: 28px 20px 20px;
           border-bottom: 1px solid var(--border);
+        }
+
+        .sidebar-header-row {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 12px;
+        }
+
+        .sidebar-close-btn {
+          align-items: center;
+          justify-content: center;
+          width: 40px;
+          height: 40px;
+          min-width: 40px;
+          min-height: 40px;
+          padding: 0;
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          background: var(--surface2);
+          color: var(--text-dim);
+          cursor: pointer;
+          transition: color 0.2s, border-color 0.2s, background 0.2s;
+        }
+        .sidebar-close-btn:hover {
+          color: var(--accent);
+          border-color: var(--accent);
+          background: var(--accent-dim);
+        }
+
+        .menu-btn {
+          align-items: center;
+          justify-content: center;
+          width: 44px;
+          height: 44px;
+          min-width: 44px;
+          min-height: 44px;
+          padding: 0;
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          background: var(--surface2);
+          color: var(--text-dim);
+          cursor: pointer;
+          transition: color 0.2s, border-color 0.2s, background 0.2s;
+        }
+        .menu-btn:hover {
+          color: var(--accent);
+          border-color: var(--accent);
+          background: var(--accent-dim);
         }
 
         .logo {
@@ -884,6 +1092,265 @@ export default function App() {
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+        /* ── Upload progress bar ── */
+        .upload-progress-container {
+          width: 100%;
+          margin-top: 4px;
+        }
+
+        .upload-progress-label {
+          font-size: 11px;
+          color: var(--text-dim);
+          font-family: 'DM Mono', monospace;
+          margin-bottom: 6px;
+          text-align: center;
+        }
+
+        .upload-progress-track {
+          width: 100%;
+          height: 4px;
+          background: var(--border);
+          border-radius: 2px;
+          overflow: hidden;
+        }
+
+        .upload-progress-bar {
+          height: 100%;
+          background: var(--accent);
+          border-radius: 2px;
+          transition: width 0.25s ease;
+        }
+
+        /* ── Chunk preview ── */
+        .doc-item-wrapper {
+          position: relative;
+        }
+
+        .doc-preview-btn {
+          opacity: 0;
+          background: none;
+          border: none;
+          color: var(--text-dimmer);
+          cursor: pointer;
+          padding: 4px;
+          border-radius: 4px;
+          display: flex;
+          align-items: center;
+          transition: opacity 0.15s, color 0.15s;
+          flex-shrink: 0;
+        }
+
+        .doc-item:hover .doc-preview-btn { opacity: 1; }
+        .doc-preview-btn:hover { color: var(--accent); }
+        .doc-preview-btn.active { opacity: 1; color: var(--accent); }
+
+        .chunk-popover {
+          position: absolute;
+          left: calc(100% + 8px);
+          top: 0;
+          z-index: 200;
+          width: 300px;
+          max-height: 320px;
+          background: var(--surface);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+          display: flex;
+          flex-direction: column;
+          animation: fadeInScale 0.15s ease;
+          overflow: hidden;
+        }
+
+        .chunk-popover-header {
+          padding: 10px 12px;
+          font-size: 10px;
+          text-transform: uppercase;
+          letter-spacing: 1px;
+          color: var(--text-dimmer);
+          font-family: 'DM Mono', monospace;
+          border-bottom: 1px solid var(--border);
+          flex-shrink: 0;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .chunk-popover-body {
+          overflow-y: auto;
+          flex: 1;
+          padding: 6px;
+        }
+
+        .chunk-item {
+          padding: 8px 10px;
+          border-radius: 6px;
+          margin-bottom: 4px;
+          background: var(--surface2);
+          font-size: 11px;
+          line-height: 1.5;
+        }
+
+        .chunk-item-index {
+          font-family: 'DM Mono', monospace;
+          color: var(--accent);
+          font-size: 10px;
+          margin-bottom: 3px;
+        }
+
+        .chunk-item-text {
+          color: var(--text-dim);
+          white-space: pre-wrap;
+          word-break: break-word;
+        }
+
+        .chunk-popover-loading,
+        .chunk-popover-error {
+          padding: 16px;
+          font-size: 12px;
+          color: var(--text-dimmer);
+          text-align: center;
+          font-family: 'DM Mono', monospace;
+        }
+
+        .chunk-popover-error { color: var(--danger); }
+
+        /* ── Mobile ───────────────────────────────────────────────────────────── */
+        @media (max-width: 768px) {
+          body {
+            overflow: auto;
+            -webkit-overflow-scrolling: touch;
+            height: 100dvh;
+            min-height: -webkit-fill-available;
+          }
+
+          .layout {
+            grid-template-columns: 1fr;
+            min-height: 100dvh;
+            min-height: 100vh;
+          }
+          .main { min-width: 0; }
+
+          .sidebar-backdrop {
+            display: block;
+            position: fixed;
+            inset: 0;
+            z-index: 98;
+            background: rgba(0, 0, 0, 0.45);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.25s ease;
+          }
+          .sidebar-backdrop.sidebar-backdrop-visible {
+            opacity: 1;
+            pointer-events: auto;
+          }
+
+          .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            z-index: 99;
+            width: min(320px, 85vw);
+            max-width: 100%;
+            transform: translateX(-100%);
+            transition: transform 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+            box-shadow: none;
+          }
+          .sidebar.sidebar-open {
+            transform: translateX(0);
+            box-shadow: 8px 0 24px rgba(0, 0, 0, 0.25);
+          }
+
+          .sidebar-header { padding: 20px 16px 16px; }
+          .logo { font-size: 20px; }
+          .tagline { font-size: 10px; }
+
+          .upload-area {
+            margin: 12px 16px;
+            padding: 16px;
+          }
+          .upload-text { font-size: 11px; }
+
+          .doc-list { padding: 6px; }
+          .doc-item {
+            padding: 12px 12px;
+            min-height: 48px;
+          }
+          .doc-delete {
+            opacity: 1;
+            min-width: 44px;
+            min-height: 44px;
+            padding: 10px;
+          }
+          .doc-preview-btn {
+            opacity: 1;
+            min-width: 36px;
+            min-height: 36px;
+            padding: 8px;
+          }
+          .chunk-popover {
+            position: fixed;
+            left: 16px;
+            right: 16px;
+            top: auto;
+            bottom: 80px;
+            width: auto;
+            max-height: 40vh;
+          }
+          .scope-bar { margin: 8px 12px 12px; padding: 10px 12px; }
+
+          .main-header {
+            padding: 12px 16px;
+            gap: 8px;
+            min-height: 56px;
+          }
+          .main-title { font-size: 16px; }
+          .theme-toggle, .clear-btn {
+            min-width: 44px;
+            min-height: 44px;
+          }
+          .theme-toggle { width: 44px; height: 44px; padding: 0; display: flex; align-items: center; justify-content: center; }
+          .clear-btn { padding: 10px 14px; font-size: 12px; }
+
+          .chat-area {
+            padding: 16px;
+            gap: 12px;
+            padding-bottom: env(safe-area-inset-bottom, 16px);
+          }
+          .empty-state h2 { font-size: 22px; }
+          .empty-state p { font-size: 13px; max-width: 100%; padding: 0 8px; }
+          .message-bubble { padding: 12px 14px; font-size: 15px; }
+
+          .input-area {
+            padding: 12px 16px 20px;
+            padding-bottom: max(20px, env(safe-area-inset-bottom));
+          }
+          .input-row {
+            padding: 10px 10px 10px 14px;
+            min-height: 52px;
+          }
+          .question-input { font-size: 16px; }
+          .send-btn {
+            width: 44px;
+            height: 44px;
+            min-width: 44px;
+            min-height: 44px;
+          }
+          .input-hint { font-size: 10px; margin-top: 6px; }
+
+          .access-gate { padding: 16px; align-items: flex-start; padding-top: max(16px, env(safe-area-inset-top)); }
+          .access-gate-box { padding: 24px 20px; max-width: 100%; }
+        }
+
+        /* Small phones */
+        @media (max-width: 380px) {
+          .sidebar { width: 100%; }
+          .main-header { padding: 10px 12px; }
+          .chat-area { padding: 12px; }
+          .input-area { padding: 10px 12px 16px; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+        }
       `}</style>
 
       {!unlocked ? (
@@ -907,13 +1374,31 @@ export default function App() {
           </div>
         </div>
       ) : (
-      <div className="layout">
+      <div className={`layout ${sidebarOpen ? "sidebar-open" : ""}`}>
+        {/* Mobile backdrop when sidebar is open */}
+        <div
+          className={`sidebar-backdrop ${sidebarOpen ? "sidebar-backdrop-visible" : ""}`}
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
 
         {/* ── Sidebar ── */}
-        <div className="sidebar">
+        <div className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
           <div className="sidebar-header">
-            <div className="logo">doc<span>.</span>qa</div>
-            <div className="tagline">RAG-powered document chat</div>
+            <div className="sidebar-header-row">
+              <div>
+                <div className="logo">doc<span>.</span>qa</div>
+                <div className="tagline">RAG-powered document chat</div>
+              </div>
+              <button
+                type="button"
+                className="sidebar-close-btn"
+                onClick={() => setSidebarOpen(false)}
+                aria-label="Close menu"
+              >
+                <CloseIcon />
+              </button>
+            </div>
             <button
               type="button"
               onClick={lockOut}
@@ -949,14 +1434,23 @@ export default function App() {
             <div className="upload-icon">
               {uploading ? <SpinnerIcon /> : <UploadIcon />}
             </div>
-            <div className="upload-text">
-              <strong>{uploading ? "Processing…" : "Upload PDF"}</strong>
-              {uploading ? "Embedding chunks" : "drag & drop or click"}
-            </div>
+            {uploading ? (
+              <div className="upload-progress-container">
+                <div className="upload-progress-label">Processing… {Math.round(uploadProgress)}%</div>
+                <div className="upload-progress-track">
+                  <div className="upload-progress-bar" style={{ width: `${uploadProgress}%` }} />
+                </div>
+              </div>
+            ) : (
+              <div className="upload-text">
+                <strong>Upload Document</strong>
+                drag &amp; drop or click
+              </div>
+            )}
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf"
+              accept=".pdf,.docx,.txt,.md,.csv"
               style={{ display: "none" }}
               onChange={e => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ""; }}
             />
@@ -970,34 +1464,73 @@ export default function App() {
 
             {documents.length === 0 ? (
               <div className="empty-docs">
-                No documents yet.<br />Upload a PDF to get started.
+                No documents yet.<br />Upload a document to get started.
               </div>
             ) : (
               documents.map((doc, idx) => (
-                <div
-                  key={doc.id}
-                  className={`doc-item ${selectedIds.has(doc.id) ? "selected" : ""}`}
-                  style={{ animationDelay: `${idx * 0.04}s` }}
-                  onClick={() => toggleSelect(doc.id)}
-                >
-                  <div className="doc-checkbox">
-                    {selectedIds.has(doc.id) && (
-                      <svg className="doc-checkbox-check" viewBox="0 0 8 8" fill="currentColor">
-                        <path d="M1 4l2 2 4-4" stroke="currentColor" strokeWidth="1.5" fill="none"/>
-                      </svg>
-                    )}
-                  </div>
-                  <div className="doc-info">
-                    <div className="doc-name" title={doc.filename}>{doc.filename}</div>
-                    <div className="doc-meta">{doc.chunk_count} chunks</div>
-                  </div>
-                  <button
-                    className="doc-delete"
-                    onClick={e => { e.stopPropagation(); deleteDocument(doc.id); }}
-                    title="Delete"
+                <div key={doc.id} className="doc-item-wrapper">
+                  <div
+                    className={`doc-item ${selectedIds.has(doc.id) ? "selected" : ""}`}
+                    style={{ animationDelay: `${idx * 0.04}s` }}
+                    onClick={() => toggleSelect(doc.id)}
                   >
-                    <TrashIcon />
-                  </button>
+                    <div className="doc-checkbox">
+                      {selectedIds.has(doc.id) && (
+                        <svg className="doc-checkbox-check" viewBox="0 0 8 8" fill="currentColor">
+                          <path d="M1 4l2 2 4-4" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+                        </svg>
+                      )}
+                    </div>
+                    <div className="doc-info">
+                      <div className="doc-name" title={doc.filename}>{doc.filename}</div>
+                      <div className="doc-meta">
+                        {doc.chunk_count} chunks
+                        {doc.version > 1 && ` · v${doc.version}`}
+                      </div>
+                    </div>
+                    <button
+                      className={`doc-preview-btn ${openPreviewId === doc.id ? "active" : ""}`}
+                      onClick={e => togglePreview(e, doc.id)}
+                      title="Preview chunks"
+                    >
+                      <EyeIcon />
+                    </button>
+                    <button
+                      className="doc-delete"
+                      onClick={e => { e.stopPropagation(); deleteDocument(doc.id); }}
+                      title="Delete"
+                    >
+                      <TrashIcon />
+                    </button>
+                  </div>
+
+                  {/* Chunk preview popover */}
+                  {openPreviewId === doc.id && (() => {
+                    const state = chunkPreviews[doc.id];
+                    return (
+                      <div className="chunk-popover">
+                        <div className="chunk-popover-header">
+                          Chunks — {doc.filename}
+                        </div>
+                        <div className="chunk-popover-body">
+                          {!state || state.loading ? (
+                            <div className="chunk-popover-loading">Loading chunks…</div>
+                          ) : state.error ? (
+                            <div className="chunk-popover-error">{state.error}</div>
+                          ) : (
+                            state.chunks.map(chunk => (
+                              <div key={chunk.id} className="chunk-item">
+                                <div className="chunk-item-index">Chunk #{chunk.chunk_index}</div>
+                                <div className="chunk-item-text">
+                                  {chunk.content.slice(0, 120)}{chunk.content.length > 120 ? "…" : ""}
+                                </div>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               ))
             )}
@@ -1013,6 +1546,14 @@ export default function App() {
         {/* ── Main chat area ── */}
         <div className="main">
           <div className="main-header">
+            <button
+              type="button"
+              className="menu-btn"
+              onClick={() => setSidebarOpen(true)}
+              aria-label="Open documents menu"
+            >
+              <MenuIcon />
+            </button>
             <div className="main-title">Ask anything</div>
             <button className="theme-toggle" onClick={toggleTheme} title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"} aria-label="Toggle theme">
               {theme === "dark" ? <SunIcon /> : <MoonIcon />}
@@ -1030,7 +1571,7 @@ export default function App() {
                 <div className="empty-state-icon">📄</div>
                 <h2>Chat with your documents</h2>
                 <p>
-                  Upload PDFs on the left, then ask questions about them here.
+                  Upload documents on the left (.pdf, .docx, .txt, .md, .csv), then ask questions about them here.
                   Select specific documents to narrow the search scope.
                 </p>
               </div>
@@ -1061,7 +1602,7 @@ export default function App() {
                 ref={textareaRef}
                 className="question-input"
                 placeholder={documents.length === 0
-                  ? "Upload a PDF first…"
+                  ? "Upload a document first…"
                   : `Ask about ${scopeLabel.toLowerCase()}…`}
                 value={question}
                 onChange={e => setQuestion(e.target.value)}

@@ -14,6 +14,8 @@ import asyncio
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv"}
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -35,7 +37,14 @@ def require_access_code(request: Request):
             provided = auth[7:].strip()
     if provided != ACCESS_CODE:
         raise HTTPException(status_code=401, detail="Invalid or missing access code")
-from chunker import extract_text_from_pdf, chunk_text
+
+from chunker import (
+    extract_text_from_pdf,
+    extract_text_from_docx,
+    extract_text_from_txt,
+    extract_text_from_csv,
+    chunk_text,
+)
 from llm import embed_texts, embed_query, stream_chat_response
 
 limiter = Limiter(key_func=get_remote_address)
@@ -66,6 +75,16 @@ class DocumentResponse(BaseModel):
     filename: str
     uploaded_at: str
     chunk_count: int
+    version: int
+
+    class Config:
+        from_attributes = True
+
+
+class ChunkPreview(BaseModel):
+    id: str
+    chunk_index: int
+    content: str
 
     class Config:
         from_attributes = True
@@ -92,23 +111,37 @@ async def upload_document(
     db: Session = Depends(get_db),
     _: None = Depends(require_access_code),
 ):
-    """Upload a PDF, parse it, chunk it, embed it, and store everything."""
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    """Upload a document (PDF, DOCX, TXT, MD, CSV), parse it, chunk it, embed it, and store everything."""
+    filename_lower = file.filename.lower()
+    ext = next((e for e in SUPPORTED_EXTENSIONS if filename_lower.endswith(e)), None)
+    if ext is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Allowed: .pdf, .docx, .txt, .md, .csv"
+        )
 
     file_bytes = await file.read()
 
     if len(file_bytes) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large. Maximum size is 20 MB.")
 
-    # 1. Extract text
+    # 1. Extract text based on file type
     try:
-        raw_text = extract_text_from_pdf(file_bytes)
+        if ext == ".pdf":
+            raw_text = extract_text_from_pdf(file_bytes)
+        elif ext == ".docx":
+            raw_text = extract_text_from_docx(file_bytes)
+        elif ext in (".txt", ".md"):
+            raw_text = extract_text_from_txt(file_bytes)
+        elif ext == ".csv":
+            raw_text = extract_text_from_csv(file_bytes)
+        else:
+            raise ValueError(f"Unhandled extension: {ext}")
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to parse PDF: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Failed to parse file: {str(e)}")
 
     if not raw_text.strip():
-        raise HTTPException(status_code=422, detail="PDF appears to have no extractable text (may be scanned).")
+        raise HTTPException(status_code=422, detail="File appears to have no extractable text.")
 
     # 2. Chunk the text
     chunks = chunk_text(raw_text)
@@ -119,8 +152,16 @@ async def upload_document(
     batch_results = await asyncio.gather(*[embed_texts(batch) for batch in batches])
     all_embeddings = [emb for result in batch_results for emb in result]
 
-    # 4. Save document + chunks to DB
-    doc = Document(filename=file.filename)
+    # 4. Versioning: if a document with the same filename exists, replace it
+    next_version = 1
+    existing_doc = db.query(Document).filter(Document.filename == file.filename).first()
+    if existing_doc:
+        next_version = existing_doc.version + 1
+        db.delete(existing_doc)
+        db.flush()  # cascade-deletes old chunks before inserting new ones
+
+    # 5. Save new document + chunks to DB
+    doc = Document(filename=file.filename, version=next_version)
     db.add(doc)
     db.flush()  # get the doc.id before committing
 
@@ -140,7 +181,8 @@ async def upload_document(
         id=str(doc.id),
         filename=doc.filename,
         uploaded_at=doc.uploaded_at.isoformat(),
-        chunk_count=len(chunks)
+        chunk_count=len(chunks),
+        version=doc.version,
     )
 
 
@@ -153,7 +195,8 @@ def list_documents(db: Session = Depends(get_db), _: None = Depends(require_acce
             id=str(doc.id),
             filename=doc.filename,
             uploaded_at=doc.uploaded_at.isoformat(),
-            chunk_count=len(doc.chunks)
+            chunk_count=len(doc.chunks),
+            version=doc.version,
         )
         for doc in docs
     ]
@@ -172,6 +215,39 @@ def delete_document(document_id: str, db: Session = Depends(get_db), _: None = D
     db.delete(doc)
     db.commit()
     return {"message": f"Deleted document {document_id}"}
+
+
+@app.get("/api/documents/{document_id}/chunks", response_model=List[ChunkPreview])
+def get_document_chunks(
+    document_id: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_access_code),
+):
+    """Return all chunks for a document, ordered by chunk_index. Does not include embeddings."""
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid document ID.")
+
+    doc = db.query(Document).filter(Document.id == doc_uuid).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    chunks = (
+        db.query(Chunk)
+        .filter(Chunk.document_id == doc_uuid)
+        .order_by(Chunk.chunk_index)
+        .all()
+    )
+
+    return [
+        ChunkPreview(
+            id=str(c.id),
+            chunk_index=c.chunk_index,
+            content=c.content,
+        )
+        for c in chunks
+    ]
 
 
 @app.post("/api/chat")

@@ -1,3 +1,5 @@
+import io
+import csv
 import pdfplumber
 import tiktoken
 from typing import List
@@ -11,7 +13,6 @@ CHUNK_OVERLAP = 50  # token overlap between chunks
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     """Extract all text from a PDF file given as bytes."""
-    import io
     text_parts = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -19,6 +20,31 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
             if text:
                 text_parts.append(text.strip())
     return "\n\n".join(text_parts)
+
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    """Extract text from a .docx file."""
+    from docx import Document as DocxDocument
+    doc = DocxDocument(io.BytesIO(file_bytes))
+    parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    return "\n\n".join(parts)
+
+
+def extract_text_from_txt(file_bytes: bytes) -> str:
+    """Extract text from a .txt or .md file (plain UTF-8 decode)."""
+    return file_bytes.decode("utf-8", errors="replace")
+
+
+def extract_text_from_csv(file_bytes: bytes) -> str:
+    """Convert CSV rows to readable text, one row per line of 'col: val' pairs."""
+    text_io = io.StringIO(file_bytes.decode("utf-8", errors="replace"))
+    reader = csv.DictReader(text_io)
+    rows = []
+    for row in reader:
+        row_parts = [f"{k}: {v}" for k, v in row.items() if v and v.strip()]
+        if row_parts:
+            rows.append(", ".join(row_parts))
+    return "\n".join(rows)
 
 
 def chunk_text(text: str) -> List[str]:

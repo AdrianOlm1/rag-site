@@ -22,6 +22,7 @@ class Document(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filename = Column(String, nullable=False)
     uploaded_at = Column(DateTime, default=datetime.utcnow)
+    version = Column(Integer, nullable=False, default=1)
     chunks = relationship("Chunk", back_populates="document", cascade="all, delete-orphan")
 
 
@@ -45,8 +46,15 @@ def get_db():
 
 
 def init_db():
-    """Create tables and enable pgvector extension."""
+    """Create tables, enable pgvector extension, and run any additive migrations."""
     with engine.connect() as conn:
         conn.execute(__import__('sqlalchemy').text("CREATE EXTENSION IF NOT EXISTS vector"))
         conn.commit()
     Base.metadata.create_all(bind=engine)
+    # Additive migration: add version column if it doesn't exist yet
+    # (create_all won't add columns to existing tables)
+    with engine.connect() as conn:
+        conn.execute(__import__('sqlalchemy').text(
+            "ALTER TABLE documents ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1"
+        ))
+        conn.commit()
